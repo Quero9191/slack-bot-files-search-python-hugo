@@ -124,13 +124,14 @@ def _flush(channel: str):
                 total = stats.get("total_documents", 0)
                 docs = stats.get("documents", [])
                 msg = f"📊 *KB Store Statistics*\n\n"
-                msg += f"📚 *Total de documentos: {total}*\n\n"
+                msg += f"📚 *Total: {total} documentos*\n\n"
                 if docs:
-                    msg += "📄 *Documentos:*\n"
-                    for doc in sorted(docs)[:10]:  # Mostrar primeros 10
-                        msg += f"  • {doc}\n"
-                    if len(docs) > 10:
-                        msg += f"  ... y {len(docs) - 10} más\n"
+                    msg += "_Documentos en el Store:_\n"
+                    for doc in sorted(docs):
+                        # Simplificar el path mostrando solo el nombre del archivo
+                        doc_name = doc.split("/")[-1]
+                        section = doc.split("/")[1] if "/" in doc else "unknown"
+                        msg += f"• `{doc_name}` (__{section}__)\n"
         except Exception as e:
             msg = f"⚠️ Error: {e}"
         
