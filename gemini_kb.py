@@ -46,9 +46,9 @@ def get_store_stats() -> dict:
 
 def get_store_audit() -> dict:
     """
-    Audita el Store REAL consultando directamente la API de Google.
-    Muestra el estado actual sin filtros (READY + PENDING + errores).
-    Esto es más lento pero más exacto.
+    Audita el Store REAL consultando directamente la API de Google usando el SDK.
+    La API REST tiene un límite de pageSize=20 máximo, así que usamos el SDK.
+    Esto muestra el estado actual real de los documentos.
     """
     api_key = os.getenv("GEMINI_API_KEY")
     stores_raw = os.getenv("FILE_SEARCH_STORE_NAMES", "")
@@ -57,46 +57,19 @@ def get_store_audit() -> dict:
     if not api_key or not stores:
         return {"error": "Config missing"}
     
-    base_url = "https://generativelanguage.googleapis.com/v1beta"
-    total_docs = 0
-    
-    for store_name in stores:
-        page_token = None
-        attempt = 0
-        max_attempts = 3
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
         
-        while attempt < max_attempts:
-            try:
-                params = {"key": api_key, "pageSize": 50}
-                if page_token:
-                    params["pageToken"] = page_token
-                
-                url = f"{base_url}/{store_name}/documents"
-                resp = requests.get(url, params=params, timeout=10)
-                
-                if resp.status_code == 400:
-                    break
-                resp.raise_for_status()
-                
-                data = resp.json()
-                docs = data.get("documents", [])
-                total_docs += len(docs)
-                
-                page_token = data.get("nextPageToken")
-                if not page_token:
-                    break
-                attempt = 0  # Reset on success
-            except requests.exceptions.ConnectionError:
-                attempt += 1
-                import time
-                if attempt < max_attempts:
-                    time.sleep(2)
-                else:
-                    return {"error": f"Connection failed after {max_attempts} attempts"}
-            except Exception as e:
-                return {"error": str(e)}
-    
-    return {"real_documents": total_docs}
+        total_docs = 0
+        for store_name in stores:
+            docs = client.file_search_stores.documents.list(parent=store_name)
+            docs_list = list(docs)
+            total_docs += len(docs_list)
+        
+        return {"real_documents": total_docs}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def _extract_sources(resp) -> List[str]:
