@@ -158,7 +158,7 @@ def _get_answer_response(text: str) -> str:
 
             blocks.append(block)
 
-        return "\n\n".join(blocks)
+        return "\n\n" + "─" * 40 + "\n\n".join(blocks)
 
     except Exception as e:
         return f"⚠️ Error: {type(e).__name__}: {e}"
