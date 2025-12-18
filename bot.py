@@ -82,82 +82,54 @@ def parse_multi_sections(text: str):
     return parts
 
 
-def is_duplicate_event(event: dict) -> bool:
-    """Detecta si ya hemos visto este evento (evita duplicados)"""
-    global _seen_event_ids
+def _get_special_command_response(cmd: str) -> str | None:
+    """Maneja comandos especiales (stats, audit). Retorna msg si es especial, None si no."""
+    if cmd not in ["stats", "@stats", "!stats", "audit", "@audit", "!audit"]:
+        return None
     
-    # client_msg_id suele venir en mensajes de usuario
-    event_id = event.get("client_msg_id") or event.get("event_ts") or event.get("ts")
-    if not event_id:
-        return False
-
-    now = time.time()
-
-    # limpieza de IDs antiguos
-    for k, t0 in list(_seen_event_ids.items()):
-        if now - t0 > SEEN_TTL_SECONDS:
-            _seen_event_ids.pop(k, None)
-
-    if event_id in _seen_event_ids:
-        return True
-
-    _seen_event_ids[event_id] = now
-    return False
-
-
-def _flush(channel: str):
-    """Procesa el texto acumulado y envía la respuesta"""
-    with _lock:
-        text = _last_text.pop(channel, "").strip()
-        _t = _timers.pop(channel, None)
-
-    if not text:
-        return
-
-    # Comando especial: stats (desde sync_state.json - qué DEBERÍAMOS tener)
-    if text.lower() in ["stats", "@stats", "!stats"]:
-        try:
+    try:
+        if cmd.lower() in ["stats", "@stats", "!stats"]:
             stats = get_store_stats()
             if "error" in stats:
-                msg = f"❌ Error obteniendo stats: {stats['error']}"
-            else:
-                total = stats.get("total_documents", 0)
-                docs = stats.get("documents", [])
-                msg = f"📊 *KB Store Statistics (Expected)*\n\n"
-                msg += f"📚 *Total: {total} documentos*\n\n"
-                if docs:
-                    msg += "_Documentos en sync_state.json:_\n"
-                    for doc in sorted(docs):
-                        doc_name = doc.split("/")[-1]
-                        section = doc.split("/")[1] if "/" in doc else "unknown"
-                        msg += f"• `{doc_name}` (__{section}__)\n"
-        except Exception as e:
-            msg = f"⚠️ Error: {e}"
+                return f"❌ Error obteniendo stats: {stats['error']}"
+            
+            total = stats.get("total_documents", 0)
+            docs = stats.get("documents", [])
+            msg = f"📊 *KB Store Statistics (Expected)*\n\n"
+            msg += f"📚 *Total: {total} documentos*\n"
+            
+            if docs:
+                msg += "\n_Documentos en sync_state.json:_\n"
+                for doc in sorted(docs):
+                    doc_name = doc.split("/")[-1]
+                    section = doc.split("/")[1] if "/" in doc else "unknown"
+                    msg += f"• `{doc_name}` (__{section}__)\n"
+            
+            return msg
         
-        app.client.chat_postMessage(channel=channel, text=msg)
-        return
-
-    # Comando especial: audit (desde API de Google - estado REAL)
-    if text.lower() in ["audit", "@audit", "!audit"]:
-        try:
+        elif cmd.lower() in ["audit", "@audit", "!audit"]:
             audit = get_store_audit()
             if "error" in audit:
-                msg = f"❌ Error en audit: {audit['error']}"
-            else:
-                real = audit.get("real_documents", 0)
-                msg = f"🔍 *KB Store Audit (Real State)*\n\n"
-                msg += f"📚 *Documentos REALES en Google: {real}*\n\n"
-                msg += f"✅ Sincronización OK" if real > 0 else "⚠️ Store vacío o inaccesible"
-        except Exception as e:
-            msg = f"⚠️ Error: {e}"
-        
-        app.client.chat_postMessage(channel=channel, text=msg)
-        return
+                return f"❌ Error en audit: {audit['error']}"
+            
+            real = audit.get("real_documents", 0)
+            msg = f"🔍 *KB Store Audit (Real State)*\n\n"
+            msg += f"📚 *Documentos REALES en Google: {real}*\n\n"
+            msg += f"✅ Sincronización OK" if real > 0 else "⚠️ Store vacío o inaccesible"
+            return msg
+    
+    except Exception as e:
+        return f"⚠️ Error: {e}"
+    
+    return None
 
+
+def _get_answer_response(text: str) -> str:
+    """Procesa la pregunta normal y retorna el texto formateado"""
     try:
-        parts = parse_multi_sections(text)  # multi preguntas
-
+        parts = parse_multi_sections(text)
         blocks = []
+
         for metadata_filter, clean_text, label in parts:
             text_out, sources = answer(clean_text, metadata_filter=metadata_filter)
 
@@ -186,18 +158,55 @@ def _flush(channel: str):
 
             blocks.append(block)
 
-        final_text = "\n\n" + "─" * 40 + "\n\n".join(blocks)
+        return "\n\n".join(blocks)
 
     except Exception as e:
-        final_text = f"⚠️ Error: {type(e).__name__}: {e}"
+        return f"⚠️ Error: {type(e).__name__}: {e}"
+    """Detecta si ya hemos visto este evento (evita duplicados)"""
+    global _seen_event_ids
+    
+    # client_msg_id suele venir en mensajes de usuario
+    event_id = event.get("client_msg_id") or event.get("event_ts") or event.get("ts")
+    if not event_id:
+        return False
 
-    # --- NUEVO: cooldown anti doble-post ---
+    now = time.time()
+
+    # limpieza de IDs antiguos (fuera del lock para evitar bloqueos)
+    expired = [k for k, t0 in _seen_event_ids.items() if now - t0 > SEEN_TTL_SECONDS]
+    for k in expired:
+        _seen_event_ids.pop(k, None)
+
+    if event_id in _seen_event_ids:
+        return True
+
+    _seen_event_ids[event_id] = now
+    return False
+
+
+def _flush(channel: str):
+    """Procesa el texto acumulado y envía la respuesta"""
+    with _lock:
+        text = _last_text.pop(channel, "").strip()
+        _t = _timers.pop(channel, None)
+
+    if not text:
+        return
+
+    # Intentar comando especial primero
+    special_response = _get_special_command_response(text.lower())
+    if special_response:
+        final_text = special_response
+    else:
+        # Respuesta normal con IA
+        final_text = _get_answer_response(text)
+
+    # Anti doble-post cooldown
     now = time.time()
     last = _last_post_ts.get(channel, 0)
     if now - last < POST_COOLDOWN_SECONDS:
         return
     _last_post_ts[channel] = now
-    # -------------------------------
 
     app.client.chat_postMessage(channel=channel, text=final_text)
 
