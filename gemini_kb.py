@@ -17,47 +17,31 @@ Eres un asistente interno.
 
 
 def get_store_stats() -> dict:
-    """Obtiene estadísticas del Store (número de documentos, etc)"""
-    api_key = os.getenv("GEMINI_API_KEY")
-    stores_raw = os.getenv("FILE_SEARCH_STORE_NAMES", "")
-    stores = [s.strip() for s in stores_raw.split(",") if s.strip()]
+    """
+    Obtiene estadísticas del KB leyendo sync_state.json del repositorio.
+    Esto es más confiable que la API REST porque tiene el estado real.
+    """
+    import json
+    from pathlib import Path
     
-    if not api_key or not stores:
-        return {"error": "Config missing"}
+    # Buscar sync_state.json en el repo del handbook
+    handbook_path = Path("/Users/quero/Downloads/Scripts_VSCode/Handbook_MVP_File_Search/sync_state.json")
     
-    stats = {}
-    base_url = "https://generativelanguage.googleapis.com/v1beta"
+    if not handbook_path.exists():
+        return {"error": "sync_state.json not found"}
     
-    for store_name in stores:
-        doc_count = 0
-        page_token = None
+    try:
+        with open(handbook_path) as f:
+            state = json.load(f)
         
-        try:
-            while True:
-                params = {"key": api_key, "pageSize": 50}
-                if page_token:
-                    params["pageToken"] = page_token
-                
-                url = f"{base_url}/{store_name}/documents"
-                resp = requests.get(url, params=params, timeout=10)
-                
-                if resp.status_code == 400:
-                    break
-                resp.raise_for_status()
-                
-                data = resp.json()
-                docs = data.get("documents", [])
-                doc_count += len(docs)
-                
-                page_token = data.get("nextPageToken")
-                if not page_token:
-                    break
-        except Exception as e:
-            return {"error": str(e)}
+        doc_count = len(state)
         
-        stats[store_name.split("/")[-1]] = doc_count
-    
-    return stats
+        return {
+            "total_documents": doc_count,
+            "documents": list(state.keys())
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def _extract_sources(resp) -> List[str]:

@@ -121,10 +121,16 @@ def _flush(channel: str):
             if "error" in stats:
                 msg = f"❌ Error obteniendo stats: {stats['error']}"
             else:
-                msg = "📊 *KB Store Statistics*\n"
-                for store_name, count in stats.items():
-                    msg += f"• {store_name}: *{count}* documentos\n"
-                msg += f"\n✅ Total esperado: 14 documentos"
+                total = stats.get("total_documents", 0)
+                docs = stats.get("documents", [])
+                msg = f"📊 *KB Store Statistics*\n\n"
+                msg += f"📚 *Total de documentos: {total}*\n\n"
+                if docs:
+                    msg += "📄 *Documentos:*\n"
+                    for doc in sorted(docs)[:10]:  # Mostrar primeros 10
+                        msg += f"  • {doc}\n"
+                    if len(docs) > 10:
+                        msg += f"  ... y {len(docs) - 10} más\n"
         except Exception as e:
             msg = f"⚠️ Error: {e}"
         
