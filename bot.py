@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from gemini_kb import answer, get_store_stats
+from gemini_kb import answer, get_store_stats, get_store_audit
 
 
 # Cargar .env
@@ -114,7 +114,7 @@ def _flush(channel: str):
     if not text:
         return
 
-    # Comando especial: stats
+    # Comando especial: stats (desde sync_state.json - qué DEBERÍAMOS tener)
     if text.lower() in ["stats", "@stats", "!stats"]:
         try:
             stats = get_store_stats()
@@ -123,15 +123,31 @@ def _flush(channel: str):
             else:
                 total = stats.get("total_documents", 0)
                 docs = stats.get("documents", [])
-                msg = f"📊 *KB Store Statistics*\n\n"
+                msg = f"📊 *KB Store Statistics (Expected)*\n\n"
                 msg += f"📚 *Total: {total} documentos*\n\n"
                 if docs:
-                    msg += "_Documentos en el Store:_\n"
+                    msg += "_Documentos en sync_state.json:_\n"
                     for doc in sorted(docs):
-                        # Simplificar el path mostrando solo el nombre del archivo
                         doc_name = doc.split("/")[-1]
                         section = doc.split("/")[1] if "/" in doc else "unknown"
                         msg += f"• `{doc_name}` (__{section}__)\n"
+        except Exception as e:
+            msg = f"⚠️ Error: {e}"
+        
+        app.client.chat_postMessage(channel=channel, text=msg)
+        return
+
+    # Comando especial: audit (desde API de Google - estado REAL)
+    if text.lower() in ["audit", "@audit", "!audit"]:
+        try:
+            audit = get_store_audit()
+            if "error" in audit:
+                msg = f"❌ Error en audit: {audit['error']}"
+            else:
+                real = audit.get("real_documents", 0)
+                msg = f"🔍 *KB Store Audit (Real State)*\n\n"
+                msg += f"📚 *Documentos REALES en Google: {real}*\n\n"
+                msg += f"✅ Sincronización OK" if real > 0 else "⚠️ Store vacío o inaccesible"
         except Exception as e:
             msg = f"⚠️ Error: {e}"
         
