@@ -1,5 +1,6 @@
 import os
 import time
+import logging
 import threading
 import re
 from pathlib import Path
@@ -23,6 +24,9 @@ if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
     raise RuntimeError("Faltan SLACK_BOT_TOKEN / SLACK_APP_TOKEN en .env")
 
 app = App(token=SLACK_BOT_TOKEN)
+
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 # Buffer simple por canal (sin Redis)
 _lock = threading.Lock()
@@ -263,5 +267,11 @@ def on_message(event, logger):
 
 
 if __name__ == "__main__":
-    print("✅ Bot corriendo (Socket Mode)...")
-    SocketModeHandler(app, SLACK_APP_TOKEN).start()
+    logging.info("✅ Bot corriendo (Socket Mode)...")
+    # Run Socket Mode handler with ping and auto-restart loop to improve stability
+    while True:
+        try:
+            SocketModeHandler(app, SLACK_APP_TOKEN, ping_interval=5).start()
+        except Exception:
+            logging.exception("Socket Mode cayó; reiniciando en 5s…")
+            time.sleep(5)
