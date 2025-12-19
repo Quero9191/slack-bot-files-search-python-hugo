@@ -131,7 +131,11 @@ def _get_answer_response(text: str) -> str:
         blocks = []
 
         for metadata_filter, clean_text, label in parts:
-            text_out, sources = answer(clean_text, metadata_filter=metadata_filter)
+            try:
+                text_out, sources = answer(clean_text, metadata_filter=metadata_filter)
+            except Exception as e:
+                text_out = f"⚠️ Error consultando el KB: {type(e).__name__}: {e}"
+                sources = []
 
             if not text_out:
                 text_out = "❓ No he encontrado info suficiente en el KB. ¿Puedes dar más contexto?"
@@ -158,30 +162,12 @@ def _get_answer_response(text: str) -> str:
 
             blocks.append(block)
 
-        return "\n\n" + "─" * 40 + "\n\n".join(blocks)
+        # Return blocks joined with a blank line; remove visual separator line
+        return "\n\n".join(blocks)
 
     except Exception as e:
         return f"⚠️ Error: {type(e).__name__}: {e}"
-    """Detecta si ya hemos visto este evento (evita duplicados)"""
-    global _seen_event_ids
     
-    # client_msg_id suele venir en mensajes de usuario
-    event_id = event.get("client_msg_id") or event.get("event_ts") or event.get("ts")
-    if not event_id:
-        return False
-
-    now = time.time()
-
-    # limpieza de IDs antiguos (fuera del lock para evitar bloqueos)
-    expired = [k for k, t0 in _seen_event_ids.items() if now - t0 > SEEN_TTL_SECONDS]
-    for k in expired:
-        _seen_event_ids.pop(k, None)
-
-    if event_id in _seen_event_ids:
-        return True
-
-    _seen_event_ids[event_id] = now
-    return False
 
 
 def _flush(channel: str):
@@ -211,33 +197,69 @@ def _flush(channel: str):
     app.client.chat_postMessage(channel=channel, text=final_text)
 
 
+def is_duplicate_event(event) -> bool:
+    """Detecta si ya hemos visto este evento (evita duplicados). Retorna True si está visto."""
+    global _seen_event_ids
+
+    # client_msg_id suele venir en mensajes de usuario
+    event_id = event.get("client_msg_id") or event.get("event_ts") or event.get("ts")
+    if not event_id:
+        return False
+
+    now = time.time()
+
+    # limpieza de IDs antiguos
+    expired = [k for k, t0 in _seen_event_ids.items() if now - t0 > SEEN_TTL_SECONDS]
+    for k in expired:
+        _seen_event_ids.pop(k, None)
+
+    if event_id in _seen_event_ids:
+        return True
+
+    _seen_event_ids[event_id] = now
+    return False
+
+
 @app.event("message")
 def on_message(event, logger):
-    """Listener para mensajes directos al bot"""
-    # Ignora bots / subtypes
-    if event.get("bot_id") or event.get("subtype"):
-        return
-    if is_duplicate_event(event):
-        return
+    """Listener para mensajes directos al bot (con manejo de errores para evitar crash)."""
+    try:
+        # Ignora bots / subtypes
+        if event.get("bot_id") or event.get("subtype"):
+            return
+        if is_duplicate_event(event):
+            # opcional: logger.debug("Duplicate event ignored: %s", event)
+            return
 
-    # SOLO DM
-    if event.get("channel_type") != "im":
-        return
+        # SOLO DM
+        if event.get("channel_type") != "im":
+            return
 
-    channel = event.get("channel")
-    text = (event.get("text") or "").strip()
-    if not channel or not text:
-        return
+        channel = event.get("channel")
+        text = (event.get("text") or "").strip()
+        if not channel or not text:
+            return
 
-    with _lock:
-        _last_text[channel] = text
-        if channel in _timers:
-            _timers[channel].cancel()
+        with _lock:
+            _last_text[channel] = text
+            if channel in _timers:
+                _timers[channel].cancel()
 
-        t = threading.Timer(BUFFER_SECONDS, _flush, args=(channel,))
-        t.daemon = True
-        _timers[channel] = t
-        t.start()
+            t = threading.Timer(BUFFER_SECONDS, _flush, args=(channel,))
+            t.daemon = True
+            _timers[channel] = t
+            t.start()
+
+    except Exception as e:
+        # Log the exception and attempt to notify the user in-channel
+        try:
+            print(f"[ERROR] on_message failed: {type(e).__name__}: {e}")
+            ch = event.get("channel") if isinstance(event, dict) else None
+            if ch:
+                app.client.chat_postMessage(channel=ch, text=f"⚠️ Error interno: {type(e).__name__}: {e}")
+        except Exception:
+            # nothing much we can do here
+            pass
 
 
 if __name__ == "__main__":

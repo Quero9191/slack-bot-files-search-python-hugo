@@ -19,7 +19,7 @@ _Fuentes:_
 
 ### 1. Install
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -54,7 +54,7 @@ In [slack.com/apps](https://api.slack.com/apps):
 
 ### 4. Run
 ```bash
-python bot.py
+python3 bot.py
 ```
 
 Expected output:
