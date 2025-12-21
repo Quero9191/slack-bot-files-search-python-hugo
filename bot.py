@@ -33,7 +33,6 @@ _seen_event_ids: dict = {}
 POST_COOLDOWN_SECONDS = float(os.getenv("POST_COOLDOWN_SECONDS", "2.0"))
 SEEN_TTL_SECONDS = int(os.getenv("SEEN_TTL_SECONDS", "60"))
 BUFFER_SECONDS = float(os.getenv("BUFFER_SECONDS", "3.5"))
-DOCS_BASE_URL = os.getenv("DOCS_BASE_URL", "")
 
 # Section inference index (built lazily)
 _SECTION_INDEX = None  # token -> set(sections)
@@ -144,15 +143,7 @@ def _get_special_command_response(text: str) -> str | None:
                     path = d.get("path") or ""
                     name = path.split("/")[-1] if path else d.get("id", "unknown")
                     section = path.split("/")[1] if path and "/" in path else "unknown"
-                    display = name
-                    if path and (path.startswith("http://") or path.startswith("https://")):
-                        link = f"<{path}|{display}>"
-                    elif path and DOCS_BASE_URL:
-                        url = DOCS_BASE_URL.rstrip("/") + "/" + path.lstrip("/")
-                        link = f"<{url}|{display}>"
-                    else:
-                        link = display
-                    msg += f"• 📄 {link} (__{section}__)\n"
+                    msg += f"• 📄 `{name}` (__{section}__)\n"
 
             msg += "\n✅ Audit completado"
             return msg
@@ -228,24 +219,7 @@ def _get_answer_response(text: str) -> str:
 
             # Agregar fuentes con formato mejorado (si no existen ya en el bloque)
             if sources and not re.search(r"(?im)(fuentes|sources|references):\s", block):
-                formatted_sources = []
-                for s in sources:
-                    try:
-                        s_str = str(s)
-                    except Exception:
-                        s_str = s
-
-                    # if already a URL, link directly; else, if DOCS_BASE_URL set, build URL
-                    if s_str.startswith("http://") or s_str.startswith("https://"):
-                        link = f"<{s_str}|{s_str}>"
-                    elif DOCS_BASE_URL:
-                        url = DOCS_BASE_URL.rstrip("/") + "/" + s_str.lstrip("/")
-                        link = f"<{url}|{s_str}>"
-                    else:
-                        link = s_str
-                    formatted_sources.append(f"📄 {link}")
-
-                sources_formatted = "\n".join(formatted_sources)
+                sources_formatted = "\n".join([f"📄 {s}" for s in sources])
                 block += f"\n\n_Fuentes:_\n{sources_formatted}"
 
             blocks.append(block)
