@@ -4,128 +4,183 @@ import logging
 import threading
 import re
 from pathlib import Path
+from gemini_kb import answer, get_store_audit
+import json
 
-from dotenv import load_dotenv
+# load .env if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from gemini_kb import answer, get_store_stats, get_store_audit
-
-
-# Cargar .env
-env_path = Path(__file__).with_name(".env")
-load_dotenv(env_path)
-
+# Slack app initialization (reads tokens from env or .env)
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
-BUFFER_SECONDS = float(os.getenv("BUFFER_SECONDS", "3.5"))
+app = App(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else App()
 
-if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
-    raise RuntimeError("Faltan SLACK_BOT_TOKEN / SLACK_APP_TOKEN en .env")
-
-app = App(token=SLACK_BOT_TOKEN)
-
-# Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-
-# Buffer simple por canal (sin Redis)
+# Runtime globals for buffering / dedupe
 _lock = threading.Lock()
-_timers = {}     # channel -> Timer
-_last_text = {}  # channel -> text
-_seen_event_ids = {}
-SEEN_TTL_SECONDS = 120  # 2 minutos
+_last_text: dict = {}
+_timers: dict = {}
+_last_post_ts: dict = {}
+_seen_event_ids: dict = {}
 
-_last_post_ts = {}
-POST_COOLDOWN_SECONDS = 0.8  # evita doble post muy seguido
+# Tunables (env override)
+POST_COOLDOWN_SECONDS = float(os.getenv("POST_COOLDOWN_SECONDS", "2.0"))
+SEEN_TTL_SECONDS = int(os.getenv("SEEN_TTL_SECONDS", "60"))
+BUFFER_SECONDS = float(os.getenv("BUFFER_SECONDS", "3.5"))
+DOCS_BASE_URL = os.getenv("DOCS_BASE_URL", "")
+
+# Section inference index (built lazily)
+_SECTION_INDEX = None  # token -> set(sections)
+_SECTIONS = None
+
+
+def build_section_index(sync_state_path: str | Path = None):
+    """Construye un índice simple token -> sections a partir de `sync_state.json`.
+    Utiliza los nombres de fichero y la ruta para generar tokens asociados a cada sección.
+    """
+    global _SECTION_INDEX, _SECTIONS
+    if _SECTION_INDEX is not None and _SECTIONS is not None:
+        return
+
+    if sync_state_path is None:
+        sync_state_path = os.getenv("SYNC_STATE_PATH", "/Users/quero/Downloads/Scripts_VSCode/Handbook_MVP_File_Search/sync_state.json")
+
+    try:
+        p = Path(sync_state_path)
+        if not p.exists():
+            _SECTION_INDEX = {}
+            _SECTIONS = set()
+            return
+
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        idx = {}
+        secs = set()
+        for fullpath in raw.keys():
+            parts = fullpath.split("/")
+            if len(parts) < 2:
+                continue
+            section = parts[1]
+            secs.add(section)
+            name = parts[-1]
+            # tokens from filename and section
+            tokens = re.findall(r"\w+", name.lower())
+            tokens += re.findall(r"\w+", section.lower())
+            for t in tokens:
+                if not t:
+                    continue
+                idx.setdefault(t, set()).add(section)
+
+        _SECTION_INDEX = idx
+        _SECTIONS = secs
+    except Exception:
+        _SECTION_INDEX = {}
+        _SECTIONS = set()
+
+
+def infer_section_from_text(text: str) -> str | None:
+    """Infieres la sección más probable desde `text` usando el índice.
+    Regresa el nombre de la sección o None si no hay suficiente evidencia.
+    """
+    try:
+        build_section_index()
+        if not _SECTION_INDEX:
+            return None
+
+        q = (text or "").lower()
+        words = re.findall(r"\w+", q)
+        scores = {}
+        # direct match of section name has high weight
+        for s in _SECTIONS:
+            if s and re.search(rf"\b{re.escape(s)}\b", q, flags=re.I):
+                scores[s] = scores.get(s, 0) + 5
+
+        for w in words:
+            secs = _SECTION_INDEX.get(w)
+            if not secs:
+                continue
+            for s in secs:
+                scores[s] = scores.get(s, 0) + 1
+
+        if not scores:
+            return None
+
+        # pick best
+        best, best_score = max(scores.items(), key=lambda kv: kv[1])
+        # threshold: need at least 2 points or direct match
+        if best_score >= 2:
+            return best
+        return None
+    except Exception:
+        return None
+
+
+def _get_special_command_response(text: str) -> str | None:
+    """Maneja comandos especiales como `audit`.
+    Retorna un mensaje formateado o None si no es un comando especial.
+    """
+    try:
+        if not text:
+            return None
+
+        if text.strip() in ("audit", "kb audit", "store audit"):
+            audit = get_store_audit()
+            if isinstance(audit, dict) and "error" in audit:
+                return f"❌ Error en audit: {audit['error']}"
+
+            real = audit.get("real_documents", 0)
+            docs = audit.get("documents", [])
+            msg = f"🔍 *KB Store Audit (Real State)*\n\n"
+            msg += f"📚 *Documentos REALES en Google: {real}*\n\n"
+
+            if docs:
+                msg += "_Documentos:_\n"
+                for d in docs:
+                    path = d.get("path") or ""
+                    name = path.split("/")[-1] if path else d.get("id", "unknown")
+                    section = path.split("/")[1] if path and "/" in path else "unknown"
+                    display = name
+                    if path and (path.startswith("http://") or path.startswith("https://")):
+                        link = f"<{path}|{display}>"
+                    elif path and DOCS_BASE_URL:
+                        url = DOCS_BASE_URL.rstrip("/") + "/" + path.lstrip("/")
+                        link = f"<{url}|{display}>"
+                    else:
+                        link = display
+                    msg += f"• 📄 {link} (__{section}__)\n"
+
+            msg += "\n✅ Audit completado"
+            return msg
+
+        return None
+    except Exception as e:
+        return f"⚠️ Error: {e}"
 
 
 def parse_multi_sections(text: str):
+    """Parsea consultas con prefijo de sección opcional.
+    Devuelve lista de tuplas: (metadata_filter, clean_text, label)
+    Ejemplos:
+      "incidents: cómo..." -> ({'section': 'incidents'}, 'cómo...', 'incidents')
+      "pregunta normal" -> (None, 'pregunta normal', None)
     """
-    Soporta varias preguntas en el mismo mensaje:
-    growth: ...
-    devrel: ...
-    handbook: ...
-    """
-    t = (text or "").strip()
+    if not text:
+        return [(None, "", None)]
 
-    alias_to_section = {
-        "incident": "incidents",
-        "incidents": "incidents",
-        "growth": "growth",
-        "devrel": "devrel",
-        "handbook": "handbook",
-        "organization": "organization",
-        "shared": "shared",
-        "changelog": "changelog",
-    }
+    m = re.match(r"^([A-Za-z0-9_-]+):\s*(.+)$", text.strip())
+    if m:
+        label = m.group(1).lower()
+        rest = m.group(2).strip()
+        # Return metadata_filter as a string expression accepted by File Search
+        mf = f'section="{label}"'
+        return [(mf, rest, label)]
 
-    # Exigimos ":" para separar bien cuando hay varias
-    pattern = r"(?i)\b(incident|incidents|growth|devrel|handbook|organization|shared|changelog)\s*:\s*"
-    matches = list(re.finditer(pattern, t))
-
-    # Si no hay prefijos, devolvemos todo como una sola pregunta sin filtro
-    if not matches:
-        return [(None, t, None)]
-
-    parts = []
-    for i, m in enumerate(matches):
-        raw = m.group(1).lower()
-        section = alias_to_section.get(raw)
-
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(t)
-        q = t[start:end].strip()
-
-        if section and q:
-            parts.append((f'section="{section}"', q, section))
-
-    # Fallback de seguridad: si algo salió raro, que no pete
-    if not parts:
-        return [(None, t, None)]
-
-    return parts
-
-
-def _get_special_command_response(cmd: str) -> str | None:
-    """Maneja comandos especiales (stats, audit). Retorna msg si es especial, None si no."""
-    if cmd not in ["stats", "@stats", "!stats", "audit", "@audit", "!audit"]:
-        return None
-    
-    try:
-        if cmd.lower() in ["stats", "@stats", "!stats"]:
-            stats = get_store_stats()
-            if "error" in stats:
-                return f"❌ Error obteniendo stats: {stats['error']}"
-            
-            total = stats.get("total_documents", 0)
-            docs = stats.get("documents", [])
-            msg = f"📊 *KB Store Statistics (Expected)*\n\n"
-            msg += f"📚 *Total: {total} documentos*\n"
-            
-            if docs:
-                msg += "\n_Documentos en sync_state.json:_\n"
-                for doc in sorted(docs):
-                    doc_name = doc.split("/")[-1]
-                    section = doc.split("/")[1] if "/" in doc else "unknown"
-                    msg += f"• `{doc_name}` (__{section}__)\n"
-            
-            return msg
-        
-        elif cmd.lower() in ["audit", "@audit", "!audit"]:
-            audit = get_store_audit()
-            if "error" in audit:
-                return f"❌ Error en audit: {audit['error']}"
-            
-            real = audit.get("real_documents", 0)
-            msg = f"🔍 *KB Store Audit (Real State)*\n\n"
-            msg += f"📚 *Documentos REALES en Google: {real}*\n\n"
-            msg += f"✅ Sincronización OK" if real > 0 else "⚠️ Store vacío o inaccesible"
-            return msg
-    
-    except Exception as e:
-        return f"⚠️ Error: {e}"
-    
-    return None
+    return [(None, text.strip(), None)]
 
 
 def _get_answer_response(text: str) -> str:
@@ -136,6 +191,18 @@ def _get_answer_response(text: str) -> str:
 
         for metadata_filter, clean_text, label in parts:
             try:
+                # If no explicit section/label provided, try to infer from the text
+                if not metadata_filter:
+                    inferred = infer_section_from_text(clean_text)
+                    if inferred:
+                        metadata_filter = f'section="{inferred}"'
+                        label = inferred
+
+                # If metadata_filter is a dict (old format), convert to string
+                if isinstance(metadata_filter, dict):
+                    parts = [f'{k}="{v}"' for k, v in metadata_filter.items()]
+                    metadata_filter = " AND ".join(parts)
+
                 text_out, sources = answer(clean_text, metadata_filter=metadata_filter)
             except Exception as e:
                 text_out = f"⚠️ Error consultando el KB: {type(e).__name__}: {e}"
@@ -159,9 +226,26 @@ def _get_answer_response(text: str) -> str:
             else:
                 block = text_out
 
-            # Agregar fuentes con formato mejorado
+            # Agregar fuentes con formato mejorado (si no existen ya en el bloque)
             if sources and not re.search(r"(?im)(fuentes|sources|references):\s", block):
-                sources_formatted = "\n".join([f"📄 {s}" for s in sources])
+                formatted_sources = []
+                for s in sources:
+                    try:
+                        s_str = str(s)
+                    except Exception:
+                        s_str = s
+
+                    # if already a URL, link directly; else, if DOCS_BASE_URL set, build URL
+                    if s_str.startswith("http://") or s_str.startswith("https://"):
+                        link = f"<{s_str}|{s_str}>"
+                    elif DOCS_BASE_URL:
+                        url = DOCS_BASE_URL.rstrip("/") + "/" + s_str.lstrip("/")
+                        link = f"<{url}|{s_str}>"
+                    else:
+                        link = s_str
+                    formatted_sources.append(f"📄 {link}")
+
+                sources_formatted = "\n".join(formatted_sources)
                 block += f"\n\n_Fuentes:_\n{sources_formatted}"
 
             blocks.append(block)
@@ -268,10 +352,28 @@ def on_message(event, logger):
 
 if __name__ == "__main__":
     logging.info("✅ Bot corriendo (Socket Mode)...")
+    print("🤖 Bot encendido ✅")
+
     # Run Socket Mode handler with ping and auto-restart loop to improve stability
-    while True:
+    handler = None
+    try:
+        while True:
+            try:
+                handler = SocketModeHandler(app, SLACK_APP_TOKEN, ping_interval=5)
+                handler.start()
+            except KeyboardInterrupt:
+                # Graceful stop on Ctrl-C without trace
+                print("🛑 Bot parado con éxito (Ctrl-C detectado).")
+                break
+            except Exception:
+                logging.exception("Socket Mode cayó; reiniciando en 5s…")
+                time.sleep(5)
+    except KeyboardInterrupt:
+        print("🛑 Bot parado con éxito (Ctrl-C detectado).")
+    finally:
         try:
-            SocketModeHandler(app, SLACK_APP_TOKEN, ping_interval=5).start()
+            if handler is not None and hasattr(handler, "stop"):
+                handler.stop()
         except Exception:
-            logging.exception("Socket Mode cayó; reiniciando en 5s…")
-            time.sleep(5)
+            pass
+        print("🛑 Bot detenido.")
