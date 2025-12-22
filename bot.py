@@ -6,6 +6,10 @@ import re
 from pathlib import Path
 from gemini_kb import answer, get_store_audit
 import json
+import uuid
+from typing import Optional
+
+from gsheets_feedback import append_feedback_row
 
 # load .env if present
 try:
@@ -33,6 +37,13 @@ _seen_event_ids: dict = {}
 POST_COOLDOWN_SECONDS = float(os.getenv("POST_COOLDOWN_SECONDS", "2.0"))
 SEEN_TTL_SECONDS = int(os.getenv("SEEN_TTL_SECONDS", "60"))
 BUFFER_SECONDS = float(os.getenv("BUFFER_SECONDS", "3.5"))
+
+# Feedback settings
+_last_feedback_time: dict = {}
+_answer_context: dict = {}  # stores prompt/response context by message_ts
+FEEDBACK_COOLDOWN_SECONDS = float(os.getenv("FEEDBACK_COOLDOWN_SECONDS", "30"))
+FEEDBACK_SHEET_ID = os.getenv("FEEDBACK_SHEET_ID")
+FEEDBACK_SECRETS_PATH = os.getenv("FEEDBACK_SECRETS_PATH", "./secrets")
 
 # Section inference index (built lazily)
 _SECTION_INDEX = None  # token -> set(sections)
@@ -117,6 +128,7 @@ def infer_section_from_text(text: str) -> str | None:
         return None
     except Exception:
         return None
+
 
 
 def _get_special_command_response(text: str) -> str | None:
@@ -256,7 +268,42 @@ def _flush(channel: str):
         return
     _last_post_ts[channel] = now
 
-    app.client.chat_postMessage(channel=channel, text=final_text)
+    # Post as Block with an action button for feedback
+    answer_id = uuid.uuid4().hex
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": final_text}}
+    ]
+    try:
+        button_value = json.dumps({"answer_id": answer_id})
+    except Exception:
+        button_value = answer_id
+
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Dar feedback"},
+                "action_id": "open_feedback_modal",
+                "value": button_value
+            }
+        ]
+    })
+
+    try:
+        res = app.client.chat_postMessage(channel=channel, blocks=blocks, text=(final_text[:3000] or "response"))
+        message_ts = res.get("ts")
+        # Store context for later retrieval in feedback modal
+        if message_ts:
+            _answer_context[message_ts] = {
+                "prompt": text,
+                "response": final_text,
+                "answer_id": answer_id
+            }
+    except Exception as e:
+        logging.exception("Failed to post message with blocks; falling back to text: %s", e)
+        app.client.chat_postMessage(channel=channel, text=final_text)
+        return
 
 
 def is_duplicate_event(event) -> bool:
@@ -280,6 +327,66 @@ def is_duplicate_event(event) -> bool:
 
     _seen_event_ids[event_id] = now
     return False
+
+
+@app.action("open_feedback_modal")
+def handle_open_feedback_modal(ack, body, client, logger):
+    """Opens a Slack modal to collect feedback when the user clicks the feedback button."""
+    try:
+        ack()
+        trigger_id = body.get("trigger_id")
+        user_id = body.get("user", {}).get("id")
+
+        # Try to preserve context: message ts and channel are in the action payload
+        message = body.get("message", {})
+        channel_id = body.get("channel", {}).get("id") or message.get("channel")
+        message_ts = message.get("ts")
+
+        # value may contain answer_id
+        value = {}
+        try:
+            value = json.loads(body.get("actions", [])[0].get("value") or "{}")
+        except Exception:
+            value = {}
+
+        answer_id = value.get("answer_id") or str(uuid.uuid4().hex)
+
+        # Get stored context (prompt/response)
+        ctx = _answer_context.get(message_ts, {})
+        prompt = ctx.get("prompt", "")
+        response = ctx.get("response", "")
+
+        # Truncate long text for display in modal
+        prompt_display = (prompt[:500] + "...") if len(prompt) > 500 else prompt
+        response_display = (response[:500] + "...") if len(response) > 500 else response
+
+        view = {
+            "type": "modal",
+            "callback_id": "feedback_view",
+            "private_metadata": json.dumps({"answer_id": answer_id, "channel": channel_id, "message_ts": message_ts}),
+            "title": {"type": "plain_text", "text": "Enviar feedback"},
+            "submit": {"type": "plain_text", "text": "Enviar"},
+            "close": {"type": "plain_text", "text": "Cancelar"},
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "Gracias por tu feedback — cuéntanos qué mejorar."}},
+                {"type": "divider"},
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Tu pregunta:*\n```\n{prompt_display}\n```"}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Respuesta del bot:*\n```\n{response_display}\n```"}},
+                {"type": "divider"},
+                {"type": "input", "block_id": "rating_block", "label": {"type": "plain_text", "text": "Calificación"}, "element": {"type": "static_select", "action_id": "rating_action", "placeholder": {"type": "plain_text", "text": "Selecciona una opción"}, "options": [
+                    {"text": {"type": "plain_text", "text": "5 — Muy útil"}, "value": "5"},
+                    {"text": {"type": "plain_text", "text": "4 — Útil"}, "value": "4"},
+                    {"text": {"type": "plain_text", "text": "3 — Regular"}, "value": "3"},
+                    {"text": {"type": "plain_text", "text": "2 — Poco útil"}, "value": "2"},
+                    {"text": {"type": "plain_text", "text": "1 — Malo"}, "value": "1"}
+                ]}},
+                {"type": "input", "block_id": "comment_block", "label": {"type": "plain_text", "text": "Comentario"}, "element": {"type": "plain_text_input", "action_id": "comment_action", "multiline": True, "placeholder": {"type": "plain_text", "text": "Escribe aquí tu comentario..."}}, "optional": True}
+            ]
+        }
+
+        client.views_open(trigger_id=trigger_id, view=view)
+    except Exception as e:
+        logger.exception("open_feedback_modal failed: %s", e)
 
 
 @app.event("message")
@@ -322,6 +429,86 @@ def on_message(event, logger):
         except Exception:
             # nothing much we can do here
             pass
+
+
+@app.view("feedback_view")
+def handle_feedback_submission(ack, body, client, logger):
+    """Handles submission of the feedback modal and writes to Google Sheets."""
+    try:
+        # Acknowledge the view_submission to Slack immediately
+        ack()
+
+        user_id = body.get("user", {}).get("id")
+        view = body.get("view", {})
+        state = view.get("state", {}).get("values", {})
+        private_metadata = {}
+        try:
+            private_metadata = json.loads(view.get("private_metadata") or "{}")
+        except Exception:
+            private_metadata = {}
+
+        rating = None
+        comment = None
+        # Extract values from state
+        rb = state.get("rating_block", {})
+        if rb:
+            sel = rb.get("rating_action") or {}
+            rating = sel.get("selected_option", {}).get("value")
+
+        cb = state.get("comment_block", {})
+        if cb:
+            txt = cb.get("comment_action") or {}
+            comment = txt.get("value")
+
+        # Get user info (name and email)
+        username = ""
+        email = ""
+        try:
+            user_info = client.users_info(user=user_id)
+            if user_info.get("ok"):
+                user_obj = user_info.get("user", {})
+                username = user_obj.get("real_name") or user_obj.get("name") or ""
+                email = user_obj.get("profile", {}).get("email") or ""
+        except Exception as e:
+            logger.warning("Failed to get user info for %s: %s", user_id, e)
+
+        # Get stored context
+        message_ts = private_metadata.get("message_ts")
+        ctx = _answer_context.get(message_ts, {})
+        prompt = ctx.get("prompt", "")
+        response = ctx.get("response", "")
+
+        row = {
+            "timestamp": int(time.time()),
+            "username": username,
+            "email": email,
+            "prompt": prompt,
+            "response": response,
+            "rating": rating,
+            "comment": comment,
+            "fallback": False
+        }
+
+        # Store channel for ephemeral messages
+        channel_id = private_metadata.get("channel")
+
+        # cooldown per user
+        now = time.time()
+        last = _last_feedback_time.get(user_id, 0)
+        if now - last < FEEDBACK_COOLDOWN_SECONDS:
+            client.chat_postEphemeral(channel=channel_id or user_id, user=user_id, text=f"⏳ Por favor espera {int(FEEDBACK_COOLDOWN_SECONDS - (now-last))}s antes de enviar otro feedback.")
+            return
+
+        try:
+            append_feedback_row(row, sheet_id=FEEDBACK_SHEET_ID)
+            _last_feedback_time[user_id] = now
+            client.chat_postEphemeral(channel=channel_id or user_id, user=user_id, text="✅ Gracias — tu feedback se ha registrado.")
+        except Exception as e:
+            logger.exception("Failed to append feedback row: %s", e)
+            client.chat_postEphemeral(channel=channel_id or user_id, user=user_id, text="⚠️ No se ha podido guardar el feedback. Inténtalo más tarde.")
+
+    except Exception as e:
+        logger.exception("Error handling feedback submission: %s", e)
 
 
 if __name__ == "__main__":

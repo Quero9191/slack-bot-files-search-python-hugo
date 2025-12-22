@@ -1,3 +1,6 @@
 .venv/
 .env
 __pycache__/
+secrets/
+secrets/*
+!secrets/.gitkeep
