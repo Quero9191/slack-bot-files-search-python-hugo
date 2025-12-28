@@ -32,14 +32,14 @@ sleep 2
 echo "🚀 Starting bot from $REPO_ROOT"
 cd "$REPO_ROOT"
 if [ -f ".venv/bin/activate" ]; then
-  # Activate venv and run in background
+  # Activate venv and run in background (no logging to file)
   # shellcheck disable=SC1091
   source .venv/bin/activate
-  nohup python bot.py > /tmp/bot.log 2>&1 &
+  nohup python bot.py > /dev/null 2>&1 &
 else
-  # fallback to system python
-  nohup python3 bot.py > /tmp/bot.log 2>&1 &
+  # fallback to system python (no logging to file)
+  nohup python3 bot.py > /dev/null 2>&1 &
 fi
 
 sleep 2
-echo "✅ Bot restarted (logs at /tmp/bot.log)"
+echo "✅ Bot restarted"

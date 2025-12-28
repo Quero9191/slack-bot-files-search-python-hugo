@@ -26,6 +26,22 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
 app = App(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else App()
 
+# --- Logging setup: write to `logs/bot.log` with rotation (keeps logging minimal/INFO)
+from logging.handlers import RotatingFileHandler
+LOG_DIR = Path(__file__).parent / "logs"
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOG_DIR / "bot.log"
+    rh = RotatingFileHandler(str(log_file), maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    rh.setFormatter(fmt)
+    root_logger = logging.getLogger()
+    # If no handlers configured, set level and add file handler. Keep existing handlers if present.
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(rh)
+except Exception:
+    # If logging setup fails, continue without file logging
+    logging.exception("Failed to configure file logging")
 # Runtime globals for buffering / dedupe
 _lock = threading.Lock()
 _last_text: dict = {}

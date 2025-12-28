@@ -5,3 +5,4 @@ secrets/
 secrets/*
 !secrets/.gitkeep
 token.pickle
+logs/
