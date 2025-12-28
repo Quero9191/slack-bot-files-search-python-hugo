@@ -2,6 +2,9 @@ import os
 import time
 import logging
 import threading
+import sys
+import platform
+import signal
 import re
 from pathlib import Path
 from gemini_kb import answer, get_store_audit
@@ -28,20 +31,54 @@ app = App(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else App()
 
 # --- Logging setup: write to `logs/bot.log` with rotation (keeps logging minimal/INFO)
 from logging.handlers import RotatingFileHandler
+
+# Logging setup: rotating file + optional console; level configurable via LOG_LEVEL
 LOG_DIR = Path(__file__).parent / "logs"
 try:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / "bot.log"
-    rh = RotatingFileHandler(str(log_file), maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    rh.setFormatter(fmt)
+
     root_logger = logging.getLogger()
-    # If no handlers configured, set level and add file handler. Keep existing handlers if present.
-    root_logger.setLevel(logging.INFO)
-    root_logger.addHandler(rh)
+    level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_str, logging.INFO)
+    root_logger.setLevel(level)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s[%(process)d]: %(message)s")
+
+    # Rotating file handler
+    rh = RotatingFileHandler(str(log_file), maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    rh.setFormatter(fmt)
+    if not any(isinstance(h, RotatingFileHandler) for h in root_logger.handlers):
+        root_logger.addHandler(rh)
+
+    # Stream handler to stdout for real-time console debugging
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
+        root_logger.addHandler(sh)
+
+    logging.info("Logging configured: file=%s level=%s pid=%d cwd=%s py=%s", str(log_file), level_str, os.getpid(), os.getcwd(), platform.python_version())
 except Exception:
-    # If logging setup fails, continue without file logging
-    logging.exception("Failed to configure file logging")
+    logging.exception("Failed to configure logging")
+
+# Ensure uncaught exceptions get logged
+def _excepthook(exc_type, exc_value, exc_tb):
+    logging.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+
+sys.excepthook = _excepthook
+
+# Log and exit cleanly on SIGINT / SIGTERM
+def _signal_handler(signum, frame):
+    try:
+        name = signal.Signals(signum).name
+    except Exception:
+        name = str(signum)
+    logging.info("Received signal %s, shutting down", name)
+    # exit cleanly to trigger finally blocks
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 # Runtime globals for buffering / dedupe
 _lock = threading.Lock()
 _last_text: dict = {}
@@ -540,17 +577,21 @@ if __name__ == "__main__":
                 handler.start()
             except KeyboardInterrupt:
                 # Graceful stop on Ctrl-C without trace
+                logging.info("Bot stopped by KeyboardInterrupt (Ctrl-C)")
                 print("🛑 Bot parado con éxito (Ctrl-C detectado).")
                 break
             except Exception:
                 logging.exception("Socket Mode cayó; reiniciando en 5s…")
                 time.sleep(5)
     except KeyboardInterrupt:
+        logging.info("Bot stopped by KeyboardInterrupt (outer)")
         print("🛑 Bot parado con éxito (Ctrl-C detectado).")
     finally:
         try:
             if handler is not None and hasattr(handler, "stop"):
+                logging.info("Stopping SocketModeHandler and cleaning up")
                 handler.stop()
         except Exception:
             pass
+        logging.info("Bot shutdown complete")
         print("🛑 Bot detenido.")
